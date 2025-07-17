@@ -1,60 +1,12 @@
-# Copyright (C) 2022-2025 Intel Corporation
-# SPDX-License-Identifier: Apache-2.0
-
-"""PatchCore: Towards Total Recall in Industrial Anomaly Detection.
-
-This module implements the PatchCore model for anomaly detection using a memory bank
-of patch features extracted from a pretrained CNN backbone. The model stores
-representative patch features from normal training images and detects anomalies by
-comparing test image patches against this memory bank.
-
-The model uses a nearest neighbor search to find the most similar patches in the
-memory bank and computes anomaly scores based on these distances. It achieves high
-performance while maintaining interpretability through localization maps.
-
-Example:
-    >>> from anomalib.data import MVTecAD
-    >>> from anomalib.models import Patchcore
-    >>> from anomalib.engine import Engine
-
-    >>> # Initialize model and data
-    >>> datamodule = MVTecAD()
-    >>> model = Patchcore(
-    ...     backbone="wide_resnet50_2",
-    ...     layers=["layer2", "layer3"],
-    ...     coreset_sampling_ratio=0.1
-    ... )
-
-    >>> # Train using the Engine
-    >>> engine = Engine()
-    >>> engine.fit(model=model, datamodule=datamodule)
-
-    >>> # Get predictions
-    >>> predictions = engine.predict(model=model, datamodule=datamodule)
-
-    >>> # Configure pre-processor to reproduce paper settings
-    >>> pre_processor = Patchcore.configure_pre_processor(
-    ...     image_size=(256, 256),
-    ...     center_crop_size=(224, 224)
-    ... )
-
-Paper: https://arxiv.org/abs/2106.08265
-
-See Also:
-    - :class:`anomalib.models.image.patchcore.torch_model.PatchcoreModel`:
-        PyTorch implementation of the PatchCore model architecture
-    - :class:`anomalib.models.image.patchcore.anomaly_map.AnomalyMapGenerator`:
-        Anomaly map generation for PatchCore using nearest neighbor search
-"""
-
-import logging
+import torch
+from torch import nn
+from torch.nn import functional as F
+from torchvision.transforms.v2 import CenterCrop, Compose, Normalize, Resize, Grayscale
 from collections.abc import Sequence
 from typing import Any
 
-import torch
+import logging
 from lightning.pytorch.utilities.types import STEP_OUTPUT
-from torch import nn
-from torchvision.transforms.v2 import CenterCrop, Compose, Normalize, Resize
 
 from anomalib import LearningType
 from anomalib.data import Batch
@@ -70,81 +22,41 @@ logger = logging.getLogger(__name__)
 
 
 class Patchcore(MemoryBankMixin, AnomalibModule):
-    """PatchCore Lightning Module for anomaly detection.
+    """
+    Lightning module implementing PatchCore anomaly detection.
 
-    This class implements the PatchCore algorithm which uses a memory bank of patch
-    features for anomaly detection. Features are extracted from a pretrained CNN
-    backbone and stored in a memory bank. Anomalies are detected by comparing test
-    image patches with the stored features using nearest neighbor search.
-
-    The model works in two phases:
-    1. Training: Extract and store patch features from normal training images
-    2. Inference: Compare test image patches against stored features to detect
-       anomalies
-
-    Args:
-        backbone (str): Name of the backbone CNN network.
-            Defaults to ``"wide_resnet50_2"``.
-        layers (Sequence[str]): Names of layers to extract features from.
-            Defaults to ``("layer2", "layer3")``.
-        pre_trained (bool, optional): Whether to use pre-trained backbone weights.
-            Defaults to ``True``.
-        coreset_sampling_ratio (float, optional): Ratio for coreset sampling to
-            subsample embeddings. Defaults to ``0.1``.
-        num_neighbors (int, optional): Number of nearest neighbors to use.
-            Defaults to ``9``.
-        pre_processor (PreProcessor | bool, optional): Pre-processor instance or
-            bool flag. Defaults to ``True``.
-        post_processor (PostProcessor | bool, optional): Post-processor instance or
-            bool flag. Defaults to ``True``.
-        evaluator (Evaluator | bool, optional): Evaluator instance or bool flag.
-            Defaults to ``True``.
-        visualizer (Visualizer | bool, optional): Visualizer instance or bool flag.
-            Defaults to ``True``.
-
-    Example:
-        >>> from anomalib.data import MVTecAD
-        >>> from anomalib.models import Patchcore
-        >>> from anomalib.engine import Engine
-
-        >>> # Initialize model and data
-        >>> datamodule = MVTecAD()
-        >>> model = Patchcore(
-        ...     backbone="wide_resnet50_2",
-        ...     layers=["layer2", "layer3"],
-        ...     coreset_sampling_ratio=0.1
-        ... )
-
-        >>> # Train using the Engine
-        >>> engine = Engine()
-        >>> engine.fit(model=model, datamodule=datamodule)
-
-        >>> # Get predictions
-        >>> predictions = engine.predict(model=model, datamodule=datamodule)
-
-    Notes:
-        The model requires no optimization/backpropagation as it uses a pretrained
-        backbone and nearest neighbor search.
-
-    See Also:
-        - :class:`anomalib.models.components.AnomalibModule`:
-            Base class for all anomaly detection models
-        - :class:`anomalib.models.components.MemoryBankMixin`:
-            Mixin class for models using feature memory banks
+    - Extracts embeddings from a pretrained YOLO-backed PatchcoreModel.
+    - Builds a memory bank via coreset sampling.
+    - Performs one-class inference to detect anomalies.
+    - Optionally exports the traced model as TorchScript on training end.
     """
 
     def __init__(
         self,
-        backbone: str = "wide_resnet50_2",
-        layers: Sequence[str] = ("layer2", "layer3"),
-        pre_trained: bool = True,
+        layers: Sequence[str] = ("seg_mask",),
         coreset_sampling_ratio: float = 0.1,
         num_neighbors: int = 9,
-        pre_processor: nn.Module | bool = True,
+        pre_processor: nn.Module | bool = False,  # Disable PreProcessor
         post_processor: nn.Module | bool = True,
         evaluator: Evaluator | bool = True,
         visualizer: Visualizer | bool = True,
+        export_pt_path: str | None = None,
+        model_path: str | None = None,
     ) -> None:
+        """
+        Initialize the Patchcore Lightning module.
+
+        Args:
+            layers: Which feature map names to extract from the backbone.
+            coreset_sampling_ratio: Fraction of embeddings to keep during coreset sampling.
+            num_neighbors: Number of nearest neighbors for anomaly scoring.
+            pre_processor: PreProcessor instance or False to disable.
+            post_processor: PostProcessor instance or True to use default.
+            evaluator: Evaluator instance or True to use default.
+            visualizer: Visualizer instance or True to use default.
+            export_pt_path: If provided, path to save TorchScript model after training.
+            model_path: Path to the pretrained YOLO-backed model TorchScript file.
+        """
         super().__init__(
             pre_processor=pre_processor,
             post_processor=post_processor,
@@ -152,159 +64,112 @@ class Patchcore(MemoryBankMixin, AnomalibModule):
             visualizer=visualizer,
         )
 
-        self.model: PatchcoreModel = PatchcoreModel(
-            backbone=backbone,
-            pre_trained=pre_trained,
+        self.model = PatchcoreModel(
             layers=layers,
+            model_path=model_path,
             num_neighbors=num_neighbors,
+            target_size=(224, 224),  # Match YOLO input size
         )
         self.coreset_sampling_ratio = coreset_sampling_ratio
         self.embeddings: list[torch.Tensor] = []
-
-    @classmethod
-    def configure_pre_processor(
-        cls,
-        image_size: tuple[int, int] | None = None,
-        center_crop_size: tuple[int, int] | None = None,
-    ) -> PreProcessor:
-        """Configure the default pre-processor for PatchCore.
-
-        If valid center_crop_size is provided, the pre-processor will
-        also perform center cropping, according to the paper.
-
-        Args:
-            image_size (tuple[int, int] | None, optional): Target size for
-                resizing. Defaults to ``(256, 256)``.
-            center_crop_size (tuple[int, int] | None, optional): Size for center
-                cropping. Defaults to ``None``.
-
-        Returns:
-            PreProcessor: Configured pre-processor instance.
-
-        Raises:
-            ValueError: If at least one dimension of ``center_crop_size`` is larger
-                than correspondent ``image_size`` dimension.
-
-        Example:
-            >>> pre_processor = Patchcore.configure_pre_processor(
-            ...     image_size=(256, 256)
-            ... )
-            >>> transformed_image = pre_processor(image)
-        """
-        image_size = image_size or (256, 256)
-
-        if center_crop_size is not None:
-            if center_crop_size[0] > image_size[0] or center_crop_size[1] > image_size[1]:
-                msg = f"Center crop size {center_crop_size} cannot be larger than image size {image_size}."
-                raise ValueError(msg)
-            transform = Compose([
-                Resize(image_size, antialias=True),
-                CenterCrop(center_crop_size),
-                Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            ])
-        else:
-            transform = Compose([
-                Resize(image_size, antialias=True),
-                Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            ])
-
-        return PreProcessor(transform=transform)
+        self.export_pt_path = export_pt_path
 
     @staticmethod
     def configure_optimizers() -> None:
-        """Configure optimizers.
-
-        Returns:
-            None: PatchCore requires no optimization.
         """
-        return
+        Disable optimizers—PatchCore uses no gradient-based training.
+        """
+        return None
 
     def training_step(self, batch: Batch, *args, **kwargs) -> None:
-        """Generate feature embedding of the batch.
+        """
+        Extract embeddings on each training batch and store them.
 
         Args:
-            batch (Batch): Input batch containing image and metadata
-            *args: Additional arguments (unused)
-            **kwargs: Additional keyword arguments (unused)
-
+            batch: A Batch object containing input images.
         Returns:
-            torch.Tensor: Dummy loss tensor for Lightning compatibility
-
-        Note:
-            The method stores embeddings in ``self.embeddings`` for later use in
-            ``fit()``.
+            Dummy zero loss tensor on GPU to satisfy Lightning’s API.
         """
-        del args, kwargs  # These variables are not used.
-
+        del args, kwargs
         embedding = self.model(batch.image)
+        # Keep embedding on GPU, append directly
         self.embeddings.append(embedding)
-        # Return a dummy loss tensor
-        return torch.tensor(0.0, requires_grad=True, device=self.device)
+        print("appending embeddings")
+        return torch.tensor(0.0, requires_grad=True, device="cuda")  # Return on GPU
 
     def fit(self) -> None:
-        """Apply subsampling to the embedding collected from the training set.
-
-        This method:
-        1. Aggregates embeddings from all training batches
-        2. Applies coreset subsampling to reduce memory requirements
+        """
+        After collecting all embeddings, perform coreset sampling to build the memory bank.
         """
         logger.info("Aggregating the embedding extracted from the training set.")
-        embeddings = torch.vstack(self.embeddings)
-
+        embeddings = torch.vstack(self.embeddings).cuda()  # Stack and move to GPU
         logger.info("Applying core-set subsampling to get the embedding.")
         self.model.subsample_embedding(embeddings, self.coreset_sampling_ratio)
 
     def validation_step(self, batch: Batch, *args, **kwargs) -> STEP_OUTPUT:
-        """Generate predictions for a batch of images.
+        """
+        Run inference on validation images to produce anomaly scores and maps.
 
         Args:
-            batch (Batch): Input batch containing images and metadata
-            *args: Additional arguments (unused)
-            **kwargs: Additional keyword arguments (unused)
-
+            batch: A Batch object containing validation images.
         Returns:
-            STEP_OUTPUT: Batch with added predictions
-
-        Note:
-            Predictions include anomaly maps and scores computed using nearest
-            neighbor search.
+            Updated Batch with prediction fields (scores, maps).
         """
-        # These variables are not used.
         del args, kwargs
-
-        # Get anomaly maps and predicted scores from the model.
         predictions = self.model(batch.image)
-
-        return batch.update(**predictions._asdict())
+        return batch.update(**predictions)
 
     @property
     def trainer_arguments(self) -> dict[str, Any]:
-        """Get default trainer arguments for PatchCore.
+        """
+        Provide custom Lightning trainer arguments.
 
         Returns:
-            dict[str, Any]: Trainer arguments
-                - ``gradient_clip_val``: ``0`` (no gradient clipping needed)
-                - ``max_epochs``: ``1`` (single pass through training data)
-                - ``num_sanity_val_steps``: ``0`` (skip validation sanity checks)
+            Dict overriding default trainer settings.
         """
         return {"gradient_clip_val": 0, "max_epochs": 1, "num_sanity_val_steps": 0}
 
     @property
     def learning_type(self) -> LearningType:
-        """Get the learning type.
-
-        Returns:
-            LearningType: Always ``LearningType.ONE_CLASS`` as PatchCore only
-                trains on normal samples
+        """
+        Specify that this is a one-class learning problem.
         """
         return LearningType.ONE_CLASS
 
     @staticmethod
     def configure_post_processor() -> PostProcessor:
-        """Configure the default post-processor.
-
-        Returns:
-            PostProcessor: Post-processor for one-class models that
-                converts raw scores to anomaly predictions
+        """
+        Instantiate the default PostProcessor for anomaly map smoothing and thresholding.
         """
         return PostProcessor()
+
+    def export_torchscript(
+        self,
+        output_path: str,
+        input_shape: tuple[int, int, int, int] = (1, 1, 224, 224),
+    ) -> None:
+        """
+        Trace and save the PatchcoreModel as a TorchScript .pt file.
+
+        Args:
+            output_path: File path to write the traced model.
+            input_shape: Shape of dummy tensor for tracing (N, C, H, W).
+        """
+        # Ensure the model is in eval mode and on the appropriate device
+        self.model.eval().to(self.device)
+
+        # Dummy input matching the preprocessing
+        dummy = torch.randn(input_shape, device=self.device)
+
+        # Trace and save
+        traced = torch.jit.trace(self.model, dummy, strict=False)
+        traced.save(output_path)
+        print(f"Saved TorchScript model to {output_path}")
+
+    def on_train_end(self) -> None:
+        """
+        Lightning hook at end of training—automatically export if path provided.
+        """
+        # Automatically export .pt if path provided
+        if self.export_pt_path:
+            self.export_torchscript(self.export_pt_path)
